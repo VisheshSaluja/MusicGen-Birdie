@@ -14,95 +14,105 @@ import accelerate
 import numpy as np
 import tiktoken
 import torch
-from ul2_config import dummy_config, ul2_config, ul2_decoder_config
-import utils
+from ul2_config import ul2_config 
+from birdie_rl.example_usage.utils import music_data_generator, reward_fn
 
+# 🔥 Add Dummy Tokenizer for Music
+class FakeTokenizer:
+    """
+    Dummy tokenizer for music data (does nothing).
+    """
+    def encode(self, x):
+        return x
+
+    def decode(self, x):
+        return x
 
 # Create a configuration dictionary for Birdie and training
 config = {
-	## Birdie uses these these functions and configs.
-	## Please see ul2_config.py and utils.py for more details.
-	"reward_fn": utils.reward_fn,
-	"ds": utils.data_generator,
-	"objectives": ul2_config,
-	"tokenizer": tiktoken.get_encoding("o200k_base"),
-
-	
-	"batch_size": 8,
-	"sequence_length": 2048,
-	"num_workers": 16,
-	"steps_between_evaluations": 32,
-	"num_steps": 4096,
-	"accelerator": accelerate.Accelerator(),
+    "reward_fn": reward_fn,
+    "ds": music_data_generator,
+    "objectives": ul2_config,
+    "tokenizer": FakeTokenizer(),    # 🔥 FIX: use dummy tokenizer
+    "batch_size": 8,
+    "sequence_length": 2048,
+    "num_workers": 16,
+    "steps_between_evaluations": 32,
+    "num_steps": 4096,
+    "accelerator": accelerate.Accelerator(),
+    "music_mode": True,
+    "data_path": "/Users/vishesh/Documents/University/Spring-25/Assignment-2/MusicGen-Birdie/birdie-main/music_dataset.npy",
 }
 
-# Instantiate the Birdie object using our configuration
-birdie = Birdie(config)
+if __name__ == "__main__":
 
-# Retrieve the initial action from Birdie
-initial_action = birdie.get_current_action()
-print(f"initial_action: {initial_action}")
+	# Instantiate the Birdie object using our configuration
+	birdie = Birdie(config)
 
-# Create a deterministic NumPy random generator (for demonstration purposes)
-seeded_np_rng = np.random.default_rng(0)
+	# Retrieve the initial action from Birdie
+	initial_action = birdie.get_current_action()
+	print(f"initial_action: {initial_action}")
 
-# Create a progress bar for the main training loop
-progress_bar = tqdm(total=config["num_steps"], desc="Training")
+	# Create a deterministic NumPy random generator (for demonstration purposes)
+	seeded_np_rng = np.random.default_rng(0)
 
-# Main training loop
-for step_idx in range(config["num_steps"]):
-	# Update progress bar by one step
-	progress_bar.update(1)
+	# Create a progress bar for the main training loop
+	progress_bar = tqdm(total=config["num_steps"], desc="Training")
 
-	# Retrieve the next sample (batch) from Birdie
-	train_batch = birdie.get_next_training_sample()
-	
-	show_batch_stats = False
+	# Main training loop
+	for step_idx in range(config["num_steps"]):
+		# Update progress bar by one step
+		progress_bar.update(1)
 
-	if show_batch_stats:
+		# Retrieve the next sample (batch) from Birdie
+		train_batch = birdie.get_next_training_sample()
 
-		# Count how many input_ids are non-zero (used) vs. zero (wasted/padding)
-		used_iids = torch.where(train_batch["input_ids"] == 0, 0, 1).sum().item()
-		wasted_iids = torch.where(train_batch["input_ids"] == 0, 1, 0).sum().item()
+		show_batch_stats = False
 
-		# Track the maximum token IDs in both inputs and labels
-		max_input_ids = (train_batch["input_ids"]).max().item()
-		max_label_ids = (train_batch["label_ids"]).max().item()
+		if show_batch_stats:
+			# Count how many input_ids are non-zero (used) vs. zero (wasted/padding)
+			used_iids = torch.where(train_batch["input_ids"] == 0, 0, 1).sum().item()
+			wasted_iids = torch.where(train_batch["input_ids"] == 0, 1, 0).sum().item()
 
-		# Compute the packer efficiency as the ratio of used tokens
-		packer_efficiency = 1 - (wasted_iids / (wasted_iids + used_iids))
+			# Track the maximum token IDs in both inputs and labels
+			max_input_ids = (train_batch["input_ids"]).max().item()
+			max_label_ids = (train_batch["label_ids"]).max().item()
 
-		_results = [
-		    f"max_input_ids: {max_input_ids}, "
-		    f"max_label_ids: {max_label_ids}, "
-		    f"wasted_iids: {wasted_iids}, "
-		    f"used_iids: {used_iids}, "
-		    f"packer_efficiency: {packer_efficiency:.2%}"
-		]
-		print('\n'.join(_results))
+			# Compute the packer efficiency as the ratio of used tokens
+			packer_efficiency = 1 - (wasted_iids / (wasted_iids + used_iids))
 
-	# Check if it's time to run a validation pass
-	if birdie.time_for_eval(step_idx):
-		# Measure validation losses for each objective
-		for (objective_name, batch) in birdie.measure_validation_losses():
-			# Here we simulate a loss using a random number 
-			# (replace with a real model forward pass in practice)
-			loss = seeded_np_rng.random()
+			_results = [
+				f"max_input_ids: {max_input_ids}, ",
+				f"max_label_ids: {max_label_ids}, ",
+				f"wasted_iids: {wasted_iids}, ",
+				f"used_iids: {used_iids}, ",
+				f"packer_efficiency: {packer_efficiency:.2%}"
+			]
+			print('\n'.join(_results))
 
-			# Log this "loss" in Birdie
-			birdie.log_validation_loss(key=objective_name, loss=loss, step_idx=step_idx)
+		# Check if it's time to run a validation pass
+		if birdie.time_for_eval(step_idx):
+			# Measure validation losses for each objective
+			for (objective_name, batch) in birdie.measure_validation_losses():
+				# Here we simulate a loss using a random number 
+				loss = seeded_np_rng.random()
 
-		# Get a detailed string representation of the current action
-		(status_dict, status_str) = birdie.get_verbose_action()
-		print(status_str)
+				# Log this "loss" in Birdie
+				birdie.log_validation_loss(key=objective_name, loss=loss, step_idx=step_idx)
 
-# Show that we are done
-print("\n" * 3, end="")
-print("All done. Closing Birdie...")
+			# Get a detailed string representation of the current action
+			(status_dict, status_str) = birdie.get_verbose_action()
+			print(status_str)
 
-# Close Birdie and free associated resources
-birdie.close()
+	# Show that we are done
+	print("\n" * 3, end="")
+	print("All done. Closing Birdie...")
 
-# Hard exit to kill remaining threads or processes.
-# Someone somewhere is holding onto VRAM...
-os._exit(0)
+	# Close Birdie and free associated resources
+	birdie.close()
+
+	# Hard exit to kill remaining threads or processes.
+	# Someone somewhere is holding onto VRAM...
+	os._exit(0)
+
+

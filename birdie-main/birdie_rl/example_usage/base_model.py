@@ -29,7 +29,7 @@ import math
 import os
 import torch
 import torch.nn as nn
-import torch.nn.attention.flex_attention as flex_attention
+# import torch.nn.attention.flex_attention as flex_attention
 import torch.nn.functional as F
 
 
@@ -191,13 +191,23 @@ class MHA(nn.Module):
 		k = einops.rearrange(k, "B S H D -> B H S D", H=self.gqa_num_heads)
 		v = einops.rearrange(v, "B S (H D) -> B H S D", H=self.gqa_num_heads)
 		# flex_attention
-		attn_out = flex_attention.flex_attention(
-			query=q,
-			key=k,
-			value=v,
-			block_mask=block_mask,
-			enable_gqa=self.enable_gqa,
-		)
+		attn_out, _ = torch.nn.functional.multi_head_attention_forward(
+    query=q,
+    key=k,
+    value=v,
+    embed_dim_to_check=q.shape[-1],
+    num_heads=self.num_heads,
+    in_proj_weight=None,
+    in_proj_bias=None,
+    bias_k=None,
+    bias_v=None,
+    add_zero_attn=False,
+    dropout_p=0.0,
+    out_proj_weight=None,
+    out_proj_bias=None,
+    training=self.training,
+    need_weights=False
+)
 
 		# Reshape back
 		attn_out = einops.rearrange(attn_out, "B H S D -> B S (H D)", H=self.num_heads)
@@ -284,265 +294,348 @@ class Dropout(nn.Dropout):
 ################################################################################
 
 
-class BaseModel(nn.Module):
-	"""
-	A flexible Transformer-like model that:
-	  1) Has an embedding layer (vocab_size x hidden_size).
-	  2) Stacks MHA + MLP layers (with optional RMSNorm, GQA, rotary, etc.).
-	  3) Ends with a final RMSNorm, and has a projection to vocab_size (assuming we're doing LM).
+# class BaseModel(nn.Module):
+# 	"""
+# 	A flexible Transformer-like model that:
+# 	  1) Has an embedding layer (vocab_size x hidden_size).
+# 	  2) Stacks MHA + MLP layers (with optional RMSNorm, GQA, rotary, etc.).
+# 	  3) Ends with a final RMSNorm, and has a projection to vocab_size (assuming we're doing LM).
 
-	If label_ids is provided, returns cross-entropy loss. Otherwise returns logits.
-	"""
-	def __init__(self, layer_kwargs):
-		super().__init__()
+# 	If label_ids is provided, returns cross-entropy loss. Otherwise returns logits.
+# 	"""
+# 	def __init__(self, layer_kwargs):
+# 		super().__init__()
 
-		# Basic config
-		self.num_layers      = layer_kwargs["num_layers"]
-		self.hidden_size     = layer_kwargs.get("hidden_size", 2048)
-		self.vocab_size      = layer_kwargs.get("vocab_size", 32000)
-		self.sequence_length = layer_kwargs.get("sequence_length", 512)
-		self.batch_size      = layer_kwargs.get("batch_size", 1)
+# 		# Basic config
+# 		self.num_layers      = layer_kwargs["num_layers"]
+# 		self.hidden_size     = layer_kwargs.get("hidden_size", 2048)
+# 		self.vocab_size      = layer_kwargs.get("vocab_size", 32000)
+# 		self.sequence_length = layer_kwargs.get("sequence_length", 512)
+# 		self.batch_size      = layer_kwargs.get("batch_size", 1)
 
-		self.num_heads = layer_kwargs["num_heads"]
-		self.head_dim  = layer_kwargs.get("head_dim", self.hidden_size // self.num_heads)
+# 		self.num_heads = layer_kwargs["num_heads"]
+# 		self.head_dim  = layer_kwargs.get("head_dim", self.hidden_size // self.num_heads)
 
-		self.use_precomputed_block_mask = int(layer_kwargs.get("use_precomputed_block_mask", 0))
-		self.use_fusedlce = int(layer_kwargs.get("use_fusedlce", 0))
-		self.bidirectional = int(layer_kwargs.get('bidirectional', 0))
-
-
-		# Embedding
-		self.embeddings = Embedding(self.vocab_size, self.hidden_size)
-		fan_in = self.hidden_size
-		std = 1.0 / math.sqrt(fan_in)
-		nn.init.trunc_normal_(
-			self.embeddings.weight,
-			mean=0.0,
-			std=std,
-			a=-2 * std,
-			b=2 * std
-		)
-
-		# Precompute rotary embeddings
-		freqs_cis = rotary.precompute_freqs_cis(
-			dim=(self.head_dim),
-			end=self.sequence_length,
-			theta=layer_kwargs.get("base_decay_rate", 500_000),
-			use_scaled=False,
-			old_context_length=layer_kwargs.get("pretraining_sequence_length", self.sequence_length)
-		)
-		# register buffer
-		self.register_buffer("freqs_cis", freqs_cis, persistent=False,)
-
-		embed_dropout = layer_kwargs.get("embed_dropout", 0.0)
-		residual_dropout = layer_kwargs.get("residual_dropout", 0.0)
-
-		# Build sub-layers
-		layers = []
-		seen_layers = 0
-		while seen_layers < self.num_layers:
-			if layer_kwargs.get("use_attention", True):
-				mha = MHA(
-					**layer_kwargs,
-					freqs_cis=self.freqs_cis,
-				)
-				layers.append(mha)
-				seen_layers += 1
-				if (0.0 < residual_dropout): layers.append(Dropout(p=residual_dropout, inplace=True))
-
-			if layer_kwargs.get("use_mlp", True):
-				ffn = SwiGLU(**layer_kwargs)
-				layers.append(ffn)
-				seen_layers += 1
-				if (0.0 < residual_dropout): layers.append(Dropout(p=residual_dropout, inplace=True))
-
-		# Final RMSNorm
-		layers.append(
-			RMSNorm(
-				hidden_size=self.hidden_size,
-				eps=layer_kwargs.get("eps", 1e-5),
-				dtype=layer_kwargs.get("dtype", torch.float32),
-				device=layer_kwargs.get("device", None),
-			)
-		)
-
-		# Vocab head
-		head_in_dim = birdie_dna.utils.make_divisible_by(self.hidden_size, 128)
-		head_out_dim = self.vocab_size
-		self.vocab_head = nn.Parameter(torch.randn(head_in_dim, head_out_dim), requires_grad=True)
-		fan_in_head = head_out_dim
-		std_head = 1.0 / math.sqrt(fan_in_head)
-		nn.init.trunc_normal_(
-			self.vocab_head,
-			mean=0.0,
-			std=std_head,
-			a=-2 * std_head,
-			b=2 * std_head
-		)
-
-		# Optionally import fused LCE
-		if self.use_fusedlce:
-			from cut_cross_entropy import LinearCrossEntropy
-			self.LCE = LinearCrossEntropy()
-
-		# Construct layers
-		self.layers = nn.ModuleList()
-		self.layers.append(self.embeddings)  # first is embedding
-		if (0.0 < embed_dropout): self.layers.append(Dropout(p=embed_dropout, inplace=True))
-		self.layers.extend(layers)
-
-		# Possibly build block_mask once
-		if self.use_precomputed_block_mask:
-			def mask_mod(b, h, q_idx, kv_idx):
-				# Strictly causal
-				return (q_idx >= kv_idx)
-			self.block_mask = create_block_mask(
-				mask_mod,
-				B=self.batch_size,
-				H=1,
-				Q_LEN=self.sequence_length,
-				KV_LEN=self.sequence_length,
-				device=layer_kwargs.get("device", "cuda"),
-				_compile=True,
-				# BLOCK_SIZE=128,
-			)
-		else:
-			self.block_mask = None
-
-		# Simple cross-entropy per sample
-		def cross_entropy_per_sample(logits, label_ids):
-			"""
-			logits: (B, L, vocab_size)
-			label_ids: (B, L) with -100 to ignore
-			Returns per-sample average, shape (B,)
-			"""
-			logits_t = logits.permute(0, 2, 1)  # -> (B, vocab_size, L)
-			label_ids_ = label_ids.to(torch.long)
-			loss_per_pos = F.cross_entropy(logits_t, label_ids_, reduction='none')
-			mask = (label_ids_ != -100)
-			sum_loss = (loss_per_pos * mask).sum(dim=1)
-			count = mask.sum(dim=1).clamp(min=1)
-			return sum_loss / count
-
-		self.cross_entropy_per_sample = cross_entropy_per_sample
+# 		self.use_precomputed_block_mask = int(layer_kwargs.get("use_precomputed_block_mask", 0))
+# 		self.use_fusedlce = int(layer_kwargs.get("use_fusedlce", 0))
+# 		self.bidirectional = int(layer_kwargs.get('bidirectional', 0))
 
 
-	def update_freqs_cis(self, freqs_cis):
-		"""
-		Updates the freqs_cis buffer in the model and all MHA layers.
-		TODO: I believe I removed the stored buffers in all layers, using a single shared buffer.
-		May need to return to an old approach for model layers split across accelerators.
-		"""
-		try:
-			self.register_buffer("freqs_cis", freqs_cis, persistent=False,)
-		except RuntimeError:
-			self.freqs_cis = freqs_cis
-		print(f"  Updated model.freqs_cis.shape to {self.freqs_cis.shape}")
+# 		# Embedding
+# 		self.embeddings = Embedding(self.vocab_size, self.hidden_size)
+# 		fan_in = self.hidden_size
+# 		std = 1.0 / math.sqrt(fan_in)
+# 		nn.init.trunc_normal_(
+# 			self.embeddings.weight,
+# 			mean=0.0,
+# 			std=std,
+# 			a=-2 * std,
+# 			b=2 * std
+# 		)
 
-		for layer in self.layers:
-			if isinstance(layer, MHA):
-				try:
-					layer.register_buffer("freqs_cis", freqs_cis, persistent=False,)
-				except RuntimeError:
-					layer.freqs_cis = freqs_cis
+# 		# Precompute rotary embeddings
+# 		freqs_cis = rotary.precompute_freqs_cis(
+# 			dim=(self.head_dim),
+# 			end=self.sequence_length,
+# 			theta=layer_kwargs.get("base_decay_rate", 500_000),
+# 			use_scaled=False,
+# 			old_context_length=layer_kwargs.get("pretraining_sequence_length", self.sequence_length)
+# 		)
+# 		# register buffer
+# 		self.register_buffer("freqs_cis", freqs_cis, persistent=False,)
 
-	def reset_freqs_cis(self, seq_len: int, base_decay_rate: float = 500_000, old_context_length: int = None, accelerator=None,):
-		"""
-		Recompute the rotary embeddings for a new fixed sequence length.
-		"""
-		if old_context_length is None:
-			old_context_length = seq_len
+# 		embed_dropout = layer_kwargs.get("embed_dropout", 0.0)
+# 		residual_dropout = layer_kwargs.get("residual_dropout", 0.0)
 
-		self.sequence_length = seq_len
-		freqs_cis = rotary.precompute_freqs_cis(
-			dim=(self.head_dim),
-			end=seq_len,
-			theta=base_decay_rate,
-			use_scaled=(old_context_length < seq_len),
-			old_context_length=old_context_length,
-			accelerator=accelerator,
-		)
-		return self.update_freqs_cis(freqs_cis)
+# 		# Build sub-layers
+# 		layers = []
+# 		seen_layers = 0
+# 		while seen_layers < self.num_layers:
+# 			if layer_kwargs.get("use_attention", True):
+# 				mha = MHA(
+# 					**layer_kwargs,
+# 					freqs_cis=self.freqs_cis,
+# 				)
+# 				layers.append(mha)
+# 				seen_layers += 1
+# 				if (0.0 < residual_dropout): layers.append(Dropout(p=residual_dropout, inplace=True))
 
-	def forward(
-		self,
-		input_ids: torch.Tensor,
-		label_ids: Optional[torch.Tensor] = None,
-		segment_ids: Optional[torch.Tensor] = None,
-		attention_mask: Optional[torch.Tensor] = None,
-		return_per_sample_loss: bool = False,
-		**kwargs
-	) -> torch.Tensor:
-		"""
-		Forward pass. If label_ids are provided, return scalar cross-entropy. Otherwise, logits.
-		"""
-		B, L = input_ids.shape
-		if segment_ids is None:
-			segment_ids = torch.zeros_like(input_ids, dtype=torch.long, device=input_ids.device)
+# 			if layer_kwargs.get("use_mlp", True):
+# 				ffn = SwiGLU(**layer_kwargs)
+# 				layers.append(ffn)
+# 				seen_layers += 1
+# 				if (0.0 < residual_dropout): layers.append(Dropout(p=residual_dropout, inplace=True))
 
-		if self.bidirectional:
-			def mask_mod(b, h, q_idx, kv_idx):
-				# Check if both query and key/value tokens are in the prefix (i.e., attention_mask is 1)
-				prefix_q = (attention_mask[b, q_idx] == 1)
-				prefix_kv = (attention_mask[b, kv_idx] == 1)
-				prefix_mask = (prefix_q & prefix_kv)
+# 		# Final RMSNorm
+# 		layers.append(
+# 			RMSNorm(
+# 				hidden_size=self.hidden_size,
+# 				eps=layer_kwargs.get("eps", 1e-5),
+# 				dtype=layer_kwargs.get("dtype", torch.float32),
+# 				device=layer_kwargs.get("device", None),
+# 			)
+# 		)
 
-				# Causal mask: allow attention only to previous tokens (including current token)
-				causal_mask = q_idx >= kv_idx
+# 		# Vocab head
+# 		head_in_dim = birdie_dna.utils.make_divisible_by(self.hidden_size, 128)
+# 		head_out_dim = self.vocab_size
+# 		self.vocab_head = nn.Parameter(torch.randn(head_in_dim, head_out_dim), requires_grad=True)
+# 		fan_in_head = head_out_dim
+# 		std_head = 1.0 / math.sqrt(fan_in_head)
+# 		nn.init.trunc_normal_(
+# 			self.vocab_head,
+# 			mean=0.0,
+# 			std=std_head,
+# 			a=-2 * std_head,
+# 			b=2 * std_head
+# 		)
 
-				# Combine prefix mask and causal mask using logical OR
-				prefix_or_causal_mask = prefix_mask | causal_mask
+# 		# Optionally import fused LCE
+# 		if self.use_fusedlce:
+# 			from cut_cross_entropy import LinearCrossEntropy
+# 			self.LCE = LinearCrossEntropy()
 
-				# Segment mask: allow attention only within the same segment
-				segment_mask = segment_ids[b, q_idx] == segment_ids[b, kv_idx]
+# 		# Construct layers
+# 		self.layers = nn.ModuleList()
+# 		self.layers.append(self.embeddings)  # first is embedding
+# 		if (0.0 < embed_dropout): self.layers.append(Dropout(p=embed_dropout, inplace=True))
+# 		self.layers.extend(layers)
 
-				# Final mask: combine all masks using logical AND
-				return prefix_or_causal_mask & segment_mask
-		else:
+# 		# Possibly build block_mask once
+# 		if self.use_precomputed_block_mask:
+# 			def mask_mod(b, h, q_idx, kv_idx):
+# 				# Strictly causal
+# 				return (q_idx >= kv_idx)
+# 			self.block_mask = create_block_mask(
+# 				mask_mod,
+# 				B=self.batch_size,
+# 				H=1,
+# 				Q_LEN=self.sequence_length,
+# 				KV_LEN=self.sequence_length,
+# 				device=layer_kwargs.get("device", "cuda"),
+# 				_compile=True,
+# 				# BLOCK_SIZE=128,
+# 			)
+# 		else:
+# 			self.block_mask = None
 
-			def mask_mod(b, h, q_idx, kv_idx):
-				# Causal mask with support for segment_ids
-				causal_mask = (q_idx >= kv_idx)
-				segment_mask = (segment_ids[b, q_idx] == segment_ids[b, kv_idx])
-				return causal_mask & segment_mask
+# 		# Simple cross-entropy per sample
+# 		def cross_entropy_per_sample(logits, label_ids):
+# 			"""
+# 			logits: (B, L, vocab_size)
+# 			label_ids: (B, L) with -100 to ignore
+# 			Returns per-sample average, shape (B,)
+# 			"""
+# 			logits_t = logits.permute(0, 2, 1)  # -> (B, vocab_size, L)
+# 			label_ids_ = label_ids.to(torch.long)
+# 			loss_per_pos = F.cross_entropy(logits_t, label_ids_, reduction='none')
+# 			mask = (label_ids_ != -100)
+# 			sum_loss = (loss_per_pos * mask).sum(dim=1)
+# 			count = mask.sum(dim=1).clamp(min=1)
+# 			return sum_loss / count
 
-		block_mask = create_block_mask(
-			mask_mod,
-			B=B,
-			H=1,
-			Q_LEN=L,
-			KV_LEN=L,
-			device=input_ids.device,
-			_compile=True
-		)
+# 		self.cross_entropy_per_sample = cross_entropy_per_sample
 
-		# Pass through the layers
-		x = input_ids
-		for layer in self.layers:
-			x = layer(x, block_mask=block_mask, freqs_cis=self.freqs_cis)
 
-		# If label_ids were not provided, return logits
-		if label_ids is None:
-			B, L, D = x.shape
-			logits = torch.matmul(x.view(-1, D), self.vocab_head.to(x.dtype))
-			logits = logits.view(B, L, self.vocab_size)
-			return logits
+# 	def update_freqs_cis(self, freqs_cis):
+# 		"""
+# 		Updates the freqs_cis buffer in the model and all MHA layers.
+# 		TODO: I believe I removed the stored buffers in all layers, using a single shared buffer.
+# 		May need to return to an old approach for model layers split across accelerators.
+# 		"""
+# 		try:
+# 			self.register_buffer("freqs_cis", freqs_cis, persistent=False,)
+# 		except RuntimeError:
+# 			self.freqs_cis = freqs_cis
+# 		print(f"  Updated model.freqs_cis.shape to {self.freqs_cis.shape}")
 
-		# Else compute cross-entropy
-		# 1) If fused LCE is enabled:
-		if self.use_fusedlce:
-			logits_16 = x.to(torch.float16)
-			w_16 = self.vocab_head.transpose(0, 1).to(torch.float16)
-			loss = self.LCE(logits_16, w_16, label_ids)
-			if return_per_sample_loss:
-				return loss
-			return loss.mean()
+# 		for layer in self.layers:
+# 			if isinstance(layer, MHA):
+# 				try:
+# 					layer.register_buffer("freqs_cis", freqs_cis, persistent=False,)
+# 				except RuntimeError:
+# 					layer.freqs_cis = freqs_cis
+
+# 	def reset_freqs_cis(self, seq_len: int, base_decay_rate: float = 500_000, old_context_length: int = None, accelerator=None,):
+# 		"""
+# 		Recompute the rotary embeddings for a new fixed sequence length.
+# 		"""
+# 		if old_context_length is None:
+# 			old_context_length = seq_len
+
+# 		self.sequence_length = seq_len
+# 		freqs_cis = rotary.precompute_freqs_cis(
+# 			dim=(self.head_dim),
+# 			end=seq_len,
+# 			theta=base_decay_rate,
+# 			use_scaled=(old_context_length < seq_len),
+# 			old_context_length=old_context_length,
+# 			accelerator=accelerator,
+# 		)
+# 		return self.update_freqs_cis(freqs_cis)
+
+# 	def forward(
+# 		self,
+# 		input_ids: torch.Tensor,
+# 		label_ids: Optional[torch.Tensor] = None,
+# 		segment_ids: Optional[torch.Tensor] = None,
+# 		attention_mask: Optional[torch.Tensor] = None,
+# 		return_per_sample_loss: bool = False,
+# 		**kwargs
+# 	) -> torch.Tensor:
+# 		"""
+# 		Forward pass. If label_ids are provided, return scalar cross-entropy. Otherwise, logits.
+# 		"""
+# 		B, L = input_ids.shape
+# 		if segment_ids is None:
+# 			segment_ids = torch.zeros_like(input_ids, dtype=torch.long, device=input_ids.device)
+
+# 		if self.bidirectional:
+# 			def mask_mod(b, h, q_idx, kv_idx):
+# 				# Check if both query and key/value tokens are in the prefix (i.e., attention_mask is 1)
+# 				prefix_q = (attention_mask[b, q_idx] == 1)
+# 				prefix_kv = (attention_mask[b, kv_idx] == 1)
+# 				prefix_mask = (prefix_q & prefix_kv)
+
+# 				# Causal mask: allow attention only to previous tokens (including current token)
+# 				causal_mask = q_idx >= kv_idx
+
+# 				# Combine prefix mask and causal mask using logical OR
+# 				prefix_or_causal_mask = prefix_mask | causal_mask
+
+# 				# Segment mask: allow attention only within the same segment
+# 				segment_mask = segment_ids[b, q_idx] == segment_ids[b, kv_idx]
+
+# 				# Final mask: combine all masks using logical AND
+# 				return prefix_or_causal_mask & segment_mask
+# 		else:
+
+# 			def mask_mod(b, h, q_idx, kv_idx):
+# 				# Causal mask with support for segment_ids
+# 				causal_mask = (q_idx >= kv_idx)
+# 				segment_mask = (segment_ids[b, q_idx] == segment_ids[b, kv_idx])
+# 				return causal_mask & segment_mask
+
+# 		block_mask = create_block_mask(
+# 			mask_mod,
+# 			B=B,
+# 			H=1,
+# 			Q_LEN=L,
+# 			KV_LEN=L,
+# 			device=input_ids.device,
+# 			_compile=True
+# 		)
+
+# 		# Pass through the layers
+# 		x = input_ids
+# 		for layer in self.layers:
+# 			x = layer(x, block_mask=block_mask, freqs_cis=self.freqs_cis)
+
+# 		# If label_ids were not provided, return logits
+# 		if label_ids is None:
+# 			B, L, D = x.shape
+# 			logits = torch.matmul(x.view(-1, D), self.vocab_head.to(x.dtype))
+# 			logits = logits.view(B, L, self.vocab_size)
+# 			return logits
+
+# 		# Else compute cross-entropy
+# 		# 1) If fused LCE is enabled:
+# 		if self.use_fusedlce:
+# 			logits_16 = x.to(torch.float16)
+# 			w_16 = self.vocab_head.transpose(0, 1).to(torch.float16)
+# 			loss = self.LCE(logits_16, w_16, label_ids)
+# 			if return_per_sample_loss:
+# 				return loss
+# 			return loss.mean()
 		
-		# 2) Otherwise standard cross-entropy:
-		x = x.to(torch.bfloat16)
-		logits = torch.matmul(x.view(-1, x.shape[-1]), self.vocab_head.to(x.dtype))
-		logits = logits.view(B, L, self.vocab_size)
-		per_sample_loss = self.cross_entropy_per_sample(logits, label_ids)
-		if return_per_sample_loss:
-			return per_sample_loss
-		return per_sample_loss.mean()
+# 		# 2) Otherwise standard cross-entropy:
+# 		x = x.to(torch.bfloat16)
+# 		logits = torch.matmul(x.view(-1, x.shape[-1]), self.vocab_head.to(x.dtype))
+# 		logits = logits.view(B, L, self.vocab_size)
+# 		per_sample_loss = self.cross_entropy_per_sample(logits, label_ids)
+# 		if return_per_sample_loss:
+# 			return per_sample_loss
+# 		return per_sample_loss.mean()
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = x.norm(dim=-1, keepdim=True)
+        return self.weight * x / (norm + self.eps)
+
+class BaseModel(nn.Module):
+    def __init__(self, input_dim=20, hidden_size=256, num_layers=4, num_heads=8, vocab_size=32000, sequence_length=512):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.sequence_length = sequence_length
+        self.vocab_size = vocab_size
+
+        # 🔥 Instead of embedding layer, use a linear projection for MFCCs
+        self.input_proj = nn.Linear(self.input_dim, self.hidden_size)
+
+        # Transformer encoder layers
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=self.hidden_size,
+                nhead=self.num_heads,
+                dim_feedforward=self.hidden_size * 4,
+                batch_first=True,
+                norm_first=True,
+                activation="gelu"
+            )
+            for _ in range(self.num_layers)
+        ])
+
+        # Final RMSNorm
+        self.norm = RMSNorm(self.hidden_size)
+
+        # Output head (for reconstructing MFCCs)
+        self.output_proj = nn.Linear(self.hidden_size, self.input_dim)
+
+    def forward(self, input_ids: torch.Tensor, label_ids: torch.Tensor = None, **kwargs):
+        """
+        Forward pass.
+
+        Args:
+            input_ids: [batch_size, seq_len, feature_dim]
+            label_ids: [batch_size, seq_len, feature_dim] (optional)
+        """
+
+        # 🔥 Project input MFCC features into hidden space
+        x = self.input_proj(input_ids)
+
+        # Pass through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+
+        # Normalize
+        x = self.norm(x)
+
+        # 🔥 Project back to MFCC feature space
+        reconstructed = self.output_proj(x)
+
+        if label_ids is None:
+            return reconstructed
+
+        # Compute loss (MSE between reconstructed and original features)
+        loss_fn = nn.MSELoss()
+        loss = loss_fn(reconstructed, label_ids)
+
+        return loss
